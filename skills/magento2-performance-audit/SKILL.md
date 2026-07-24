@@ -98,6 +98,8 @@ govard sh -c "bin/magento queue:consumers:start <consumer_name> --max-messages=1
 
 If no `queue:consumers:start` processes are running and there's no cron/supervisor job launching them, bulk operations and async email will queue up in `queue_message` tables and never actually process — check for this rather than assuming a config flag turns "async" on.
 
+**Read the consumer list before filing this as a routine perf finding.** Most idle consumers are a performance/staleness issue (bulk operations, grid indexing, async email). But payment-related consumers (order invoicing/refunding/capture, e.g. a payment module's own `*.order.invoicing`/`*.order.refunding` queues) or inventory-reservation consumers being idle are a **business-critical** issue, not a performance one — invoices, refunds, or stock reservations silently never processing has direct financial/customer impact. Scan the consumer names for payment/inventory keywords and flag those separately at higher severity than a generic "consumers aren't running" note.
+
 ### 5. Asset Optimization
 
 ```bash
@@ -111,7 +113,11 @@ govard sh -c "bin/magento config:set dev/css/minify_files 1"
 
 ## Core Web Vitals Audit
 
-### Lighthouse CI
+### Chrome DevTools MCP (preferred, if available)
+
+When a Chrome DevTools MCP server is connected, `performance_start_trace` (with `reload: true`, `autoStop: true`) on a navigated page gives per-navigation LCP/CLS/TTFB plus an LCP phase breakdown (TTFB/load delay/load duration/render delay) and named insights (Cache, ThirdParties, RenderBlocking, ImageDelivery, etc.) in one call — no separate install, and cleaner numbers than parsing a Lighthouse report. Run it once per page type (homepage/product/category — see Per-Page-Type Audit below), since LCP/CLS meaningfully differ by page type just like everything else in this skill.
+
+### Lighthouse CI (fallback — CI pipelines, or no MCP available)
 
 ```bash
 # Install Lighthouse CI
@@ -143,6 +149,30 @@ Open Chrome DevTools > Lighthouse:
 
 ## Database Query Profiling
 
+> **Always verify what you actually captured, not just that curl returned something.** A `curl` with a bare `Accept: text/html` and no `User-Agent` (curl's own default) does not behave like a real browser request on every project — on one real audit, that exact combination silently routed into a REST/webapi content-negotiation edge case and returned a fatal 500 error page instead of the real page, on every single page type, while a real browser hitting the identical URL got a normal 200. The captured body still "looked like" a page (it had HTML, a stack of queries, a profiler table) — nothing about the capture itself signaled failure. The query counts from that 500 page were reported as real findings and were wrong by 20–70×. Two non-negotiable habits prevent this:
+> 1. **Check the HTTP status code on every captured request** (`-w "%{http_code}"`) and treat anything other than 200 as a failed capture, not data — never analyze a body you haven't confirmed the status of.
+> 2. **Use a realistic browser `Accept` header and `User-Agent`**, not framework-minimum ones, so the request exercises the same code path a real visitor hits:
+>    ```bash
+>    UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+>    ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+>    ```
+>    Every `curl` command below assumes these two variables are set first.
+
+### Query Count: Tiers, Not a Pass/Fail Gate
+
+A flat "under 80 on homepage, under 150 on category/product" number looks precise but isn't realistic for a real commerce Magento build. Vanilla Magento might hit those numbers, but a project with a typical real-world extension stack — payment gateways, GDPR/compliance, personalization, sorting/merchandising, feeds, the kind of thing every serious Magento business runs — routinely adds its own per-extension query overhead on top, and there's no single number that separates "healthy stack of extensions" from "one of them has a bug." Read the total as a tiered signal instead:
+
+| Range | Read |
+|-------|------|
+| 50–150 | Vanilla/near-vanilla Magento |
+| 150–500 | Typical for a handful of extensions — review the top repeated shapes, don't assume it's fine just because it's under some number |
+| 500–1,500 | Heavy extension stack — investigate the top 5 repeated shapes specifically; may be legitimate cumulative cost or may hide a bug |
+| 1,500+ | Almost certainly one or more real N+1 bugs on top of extension overhead, not extension overhead alone |
+
+**Establish a project-specific baseline instead of judging against a universal number.** The first time you audit a project, capture the query count as-is (after fixing anything the audit finds) and record it as that project's baseline. On every subsequent audit, compare against *that* baseline, not the table above — a regression from 400 to 900 matters regardless of which tier both numbers fall in, and a number that's always been 900 is a different conversation from a fresh spike to 900. The tiered table is a starting point for a project with no recorded baseline yet; the baseline is what actually matters once one exists.
+
+The repeated-shape and cross-page-type signals elsewhere in this skill remain the primary diagnostic either way — they tell you *what* to fix regardless of which tier the total falls into.
+
 ### DB Query Log Setup
 
 ```bash
@@ -150,14 +180,16 @@ Open Chrome DevTools > Lighthouse:
 govard sh -c "bin/magento dev:query-log:enable --include-all-queries=true --include-call-stack=true --query-time-threshold=0"
 
 # Visit the page(s) to capture queries — output goes to var/debug/db.log (plain text, NOT *.sql)
-# Format per entry: "## QUERY" header, then "SQL: ...", "AFF: <rows>", "TIME: <seconds>", then (if
-# --include-call-stack=true) a full PHP call stack — use the stack to trace a repeated/slow query
-# back to the exact file:line that issued it.
+# Format per entry: a "## <connectionId> ## QUERY" header (the connection id varies, so don't
+# anchor a grep on a bare "## QUERY" — it will never match), then "SQL: ...", "AFF: <rows>",
+# "TIME: <seconds>", then (if --include-call-stack=true) a full PHP call stack — use the stack
+# to trace a repeated/slow query back to the exact file:line that issued it.
 
 # Count queries for one page load: clear the log, hit the page once, count entries
 govard sh -c "> var/debug/db.log"
-curl -sk -o /dev/null https://store.test/
-govard sh -c "grep -c '^## QUERY' var/debug/db.log"
+code=$(curl -sk -H "Accept: $ACCEPT" -A "$UA" -o /dev/null -w "%{http_code}" https://store.test/)
+[ "$code" = "200" ] || { echo "ABORT: got HTTP $code, not 200 — this capture is not valid data"; }
+govard sh -c "grep -c '## QUERY' var/debug/db.log"
 
 # ALWAYS disable when done — this is expensive and grows fast (a single page load with
 # --include-call-stack=true can produce several MB of log; on a bigger page ~10+ MB is normal)
@@ -172,6 +204,8 @@ govard sh -c "bin/magento dev:query-log:disable"
 | Full Collection Load | `count($collection)` | Medium |
 | Missing Index | `WHERE unindexed_column` | High |
 | Expensive Join | Multiple JOINs on large tables | Medium |
+
+> **Check the call stack's namespace before deciding how to fix.** A repeated query traced back to `vendor/<vendor-name>/...` (a paid extension, not `vendor/magento/`) isn't yours to patch directly — check for a newer version of that extension first, and if none fixes it, wrap the offending call with a request-level memoization layer (a plugin/decorator that caches the result for the current request) rather than editing vendor code, which a composer update will silently overwrite.
 
 ### Query Analysis Commands
 
@@ -190,8 +224,9 @@ govard sh -c "bin/magento dev:profiler:enable html"
 
 # IMPORTANT: the profiler only activates if the request's Accept header contains "text/html" —
 # a bare `curl -s` without this header will produce NO profiler output at all (this is checked
-# in app/bootstrap.php). Always include it:
-curl -sk -H "Accept: text/html" -o page.html https://store.test/
+# in app/bootstrap.php). Always include it, along with a realistic UA/Accept (see warning above)
+# and a status check:
+curl -sk -H "Accept: $ACCEPT" -A "$UA" -o page.html -w "%{http_code}\n" https://store.test/
 
 # The profiler table is appended near the end of the HTML response body (a
 # `<table border="1">...</table>` with columns: Timer Id, Time, Avg, Cnt, Emalloc, RealMem).
@@ -238,18 +273,21 @@ govard sh -c "bin/magento cache:flush"
 
 # One throwaway request first (discard its output/log) — this lets config/eav/compiled_config
 # caches rebuild after the flush so that one-time rebuild cost doesn't contaminate the
-# per-page numbers you're about to capture
-curl -sk -H "Accept: text/html" -o /dev/null https://store.test/
+# per-page numbers you're about to capture. Confirm it's actually 200 before proceeding —
+# a broken warmup means every capture after it is measuring a failure, not a page.
+curl -sk -H "Accept: $ACCEPT" -A "$UA" -o /dev/null -w "warmup: %{http_code}\n" https://store.test/
 govard sh -c "> var/debug/db.log"
 ```
 
 ### 2. Capture each page type separately
 
-For each of the 3 URLs, clear the query log, fetch with the profiler-required `Accept` header, save the HTML (for the profiler table) and a copy of the query log, then clear the log again before the next page:
+For each of the 3 URLs, clear the query log, fetch with a realistic `Accept`/User-Agent (see warning under Database Query Profiling above), save the HTML (for the profiler table) and a copy of the query log, then clear the log again before the next page — **checking the HTTP status every time**, since a non-200 response still produces a plausible-looking HTML file and query log that will silently corrupt every number downstream if you don't check:
 
 ```bash
 for name in home product category; do
-  curl -sk -H "Accept: text/html" -o "${name}.html" "https://store.test/<url-for-$name>"
+  code=$(curl -sk -H "Accept: $ACCEPT" -A "$UA" -o "${name}.html" -w "%{http_code}" "https://store.test/<url-for-$name>")
+  echo "$name: HTTP $code"
+  [ "$code" = "200" ] || echo "  ^ NOT 200 — discard this capture, do not analyze ${name}.html/${name}.db.log"
   cp var/debug/db.log "${name}.db.log"
   govard sh -c "> var/debug/db.log"
 done
@@ -271,9 +309,11 @@ Don't leave a target environment with caches disabled and full query logging on 
 
 ### Interpreting results correctly
 
+- **A `curl` wall-clock time captured while the profiler and call-stack query logging are both active is not representative of real page load time** — the instrumentation itself (especially `--include-call-stack=true`, which walks and serializes a full PHP stack on every single query) adds real overhead, sometimes an order of magnitude. Use this setup to get query counts, repeated shapes, and file:line traces — not to report "the homepage takes N seconds." For actual load-time numbers, use the Core Web Vitals Audit above (Chrome trace / Lighthouse) on the same pages with instrumentation off.
 - **Query count vs. query time are different signals.** A small/fast local DB can show trivial total query *time* (tens of ms) even when the query *count* is 3–5x over budget — don't dismiss a high count just because local timing looks fine; the count is what will hurt on production's real network round-trips and larger tables.
 - **Not every slow section benefits from the caches you just disabled.** `layout` cache only skips re-parsing/merging layout XML — it does NOT skip instantiating the PHP block objects for every declared block (that happens fresh on every request regardless of cache, since live objects can't be cached across requests). If a page's time is dominated by layout *generation* rather than block *rendering*, re-enabling `layout`/`block_html` cache won't fix it — the real lever is reducing how many blocks/modules contribute to that page's layout.
 - **A query shape repeated with near-identical counts across all 3 page types** (not just one) is a strong signal it comes from a globally-rendered block (header/footer/cart-drawer widget), not something page-specific — prioritize fixing that over a page-specific N+1, since it's paid on every single page view site-wide.
+- **This query count is only the initial server-rendered request** — a page that looks cheap here can still defer real work to its own client-side AJAX/GraphQL calls (see Client-Side AJAX Request Load Audit below), which this count never sees. Don't report a low DB query count as "this page is lightweight" without also checking what it fetches after the HTML loads.
 
 ## Cache Invalidation Efficiency Audit
 
@@ -437,6 +477,23 @@ customerData.reload(['wishlist-widget-count'], false);
 
 ## Code-Level Performance Patterns
 
+### Scanning `app/code` for These Patterns
+
+Don't rely on reading through custom modules by eye — grep for the shapes below across custom code first (scope to `app/code`, not `vendor/`, so results are actually yours to fix; see the vendor-code note under Common Query Issues above for anything that turns up in a third-party extension instead):
+
+```bash
+# N+1: a ->load()/->create()->load() call sitting inside a foreach loop
+grep -rnE 'foreach\s*\(' --include="*.php" app/code -A3 | grep -B3 -- '->load('
+
+# Full collection load just to count items (should be ->getSize() instead)
+grep -rn 'count(\$.*[Cc]ollection' --include="*.php" app/code
+
+# Blocks marked uncacheable (prevents FPC for whatever layout handle references them)
+grep -rl 'cacheable="false"' --include="*.xml" app/code
+```
+
+The `foreach`/`->load()` grep is a heuristic, not a proof — read each hit to confirm it's actually iterating a list (a false positive: a single `->load()` inside a `foreach` that only ever runs once). For the `cacheable="false"` grep, check what page/layout handle it's declared under before flagging it — Magento's own core layout XML uses it by default on inherently personalized pages (customer account, checkout, wishlist, order history), where it's correct and expected, not a bug.
+
 ### N+1 Query Detection (From magento2-dev-core)
 
 ```php
@@ -578,8 +635,17 @@ curl -I https://store.test/ | grep -iE "x-.*debug|x-.*profile|^server:|x-powered
 
 ## Audit Report Template
 
+> **If the environment supports publishing a rendered page (e.g. Claude Code's `Artifact` tool), publish the report that way instead of — or alongside — raw markdown.** Severity reads as a color-coded chip/pill at a glance instead of a flat checklist, and a published link is easier to share with a team than pasted text. This is optional and environment-dependent (not available in Codex CLI/OpenCode/Copilot) — the markdown template below is the portable baseline every environment can produce, and if you do publish a rendered page, still include everything the template covers (URLs audited, all findings, severities) rather than a lighter summary.
+
 ```markdown
 # Performance Audit Report
+
+## URLs Audited
+- Homepage: <actual URL>
+- Category: <actual URL> (note why it's representative — product count, not the largest/an edge case)
+- Product: <actual URL> (note if the first candidate 301-redirected and this is the one that resolved 200)
+
+Always state the exact URLs tested, not just "homepage/category/product" — without them the report isn't reproducible or independently verifiable later.
 
 ## Infrastructure
 - [ ] Application Mode: production
@@ -609,11 +675,10 @@ curl -I https://store.test/ | grep -iE "x-.*debug|x-.*profile|^server:|x-powered
 - [ ] Cron running properly
 
 ## Database
-- [ ] Query count < 80 on homepage (uncached — see Per-Page-Type Audit)
-- [ ] Query count < 150 on category pages (uncached, on a page with a representative/median product count — not an empty category)
-- [ ] Query count < 150 on product pages (uncached, on a product that resolves 200 — not one missing a website assignment)
+- [ ] Query count recorded for homepage/category/product (uncached — see Per-Page-Type Audit) and compared against this project's baseline if one exists, or the tier table under Query Count: Tiers, Not a Pass/Fail Gate if this is the first audit
 - [ ] No N+1 queries detected (same query shape repeated many times in one page's `var/debug/db.log`)
 - [ ] Note: on a small/fast local DB, absolute query time can look fine even when count is over budget — flag on count, not just time
+- [ ] Note: this count only covers the initial server-rendered HTML request — it does not include the page's own client-side AJAX/GraphQL follow-up calls (see Client-Side AJAX Load above). A low DB query count does not mean low total backend cost if the page defers real work to those follow-up requests instead of the initial render — report both together, not the DB count in isolation.
 
 ## Core Web Vitals
 | Metric | Value | Status |
@@ -637,5 +702,5 @@ curl -I https://store.test/ | grep -iE "x-.*debug|x-.*profile|^server:|x-powered
 4. Trace cache invalidation efficiency — enable temporary logging (debug.log for built-in Redis/file FPC, varnishlog/ban.list for Varnish), reproduce one isolated save/action, and flag any custom code causing broad/frequent flushes beyond Magento's default targeted invalidation
 5. Capture the AJAX footprint of a fresh/anonymous page load (Network tab) and audit `sections.xml` for overly broad Customer Data invalidation — these uncacheable requests are what crawler/bot JS execution multiplies regardless of FPC hit rate
 6. Run Lighthouse / Core Web Vitals audit (if URL provided)
-7. Scan for code-level performance patterns
-8. Generate report with recommendations, prioritizing any finding that repeats across all 3 page types (site-wide impact) over page-specific ones
+7. Scan `app/code` for code-level performance patterns using the grep recipes under Code-Level Performance Patterns
+8. Generate report with recommendations, prioritizing any finding that repeats across all 3 page types (site-wide impact) over page-specific ones — publish as a rendered artifact if the environment supports it (see Audit Report Template), otherwise markdown
