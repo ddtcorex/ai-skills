@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-07-24
+
+### Added
+- `magento2-performance-audit`: **Cache Invalidation Efficiency Audit** section —
+  traces `full_page` cache flushes via Magento's built-in `cache_invalidate:`
+  debug.log entries (Redis or file backend, no env.php changes needed) or, for
+  Varnish, `varnishlog`/`ban.list`, to distinguish correctly-scoped invalidation
+  from custom code causing blanket flushes; includes a temporary diagnostic
+  plugin pattern for tracing cron/CLI-triggered flushes back to file:line, and
+  a WRONG/CORRECT code pattern for targeted vs. blanket cache clearing.
+- `magento2-performance-audit`: **Client-Side AJAX Request Load Audit** section —
+  captures the same-origin AJAX footprint of a page (customer data, GraphQL,
+  custom endpoints) across all 3 page types, since these bypass `full_page`
+  cache entirely and are what JS-executing crawlers multiply under load; covers
+  auditing `sections.xml` for overly broad Customer Data invalidation and a
+  known Magento quirk where an empty `sections=` parameter returns every
+  registered section (including the full country/region directory) instead of
+  none.
+
+Both new sections were validated live against a running Magento 2.4.7 project
+rather than written from assumption alone — this caught and corrected an
+invalid config path, an unnecessary env.php step, and a wrong assumption about
+what a "full flush" looks like in `debug.log`.
+
 ## [0.1.1] - 2026-07-24
 
 ### Added
